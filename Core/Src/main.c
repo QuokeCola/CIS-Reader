@@ -64,6 +64,21 @@ volatile uint8_t  g_capture_request = 0;   /* set by USB 's' command           *
 volatile uint8_t  g_buffer_ready    = 0;   /* set by ADC1 DMA-complete ISR     */
 volatile uint16_t g_trigger_width   = 30;  /* trigger pulse width (CLK cycles) */
 
+/* --- Multi-cycle trigger pulse ------------------------------------------- */
+/* The trigger (TIM1_CH2 / PE11) can now stay high for WHOLE CLK cycles.
+ * Mechanism: a DMA stream fed by the TIM1 update event rewrites CCR2 once per
+ * CLK period: N entries of (ARR+1) = 100 % duty (pin high the whole period),
+ * then one 0 entry that drops the pin. Pulse width is therefore exactly
+ * width_cycles CLK periods, hardware-timed, with no ISR involvement.         */
+#define TRIG_MAX_CYCLES 1024u         /* upper bound for the pulse length      */
+
+/* NOTE: this buffer is read by DMA1 (D2 domain), which CANNOT access DTCM on
+ * the H7 - so unlike the ADC buffers above it must stay in default RAM
+ * (RAM_D1 / AXI SRAM in the stock CubeMX .ld). D-cache is disabled in this
+ * project, so no cache maintenance is required either.                       */
+static uint16_t trig_dma_buf[TRIG_MAX_CYCLES + 1u];
+static DMA_HandleTypeDef hdma_tim1_up; /* DMA1_Stream2 <- TIM1 update request  */
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -79,6 +94,7 @@ static void MX_TIM1_Init(void);
 void CIS_StartCapture(void);
 void CIS_SetLED(char color);
 void CIS_FireTrigger(uint16_t width_cycles);
+static void CIS_TriggerDMA_Init(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -137,6 +153,7 @@ int main(void)
    *    We start it stopped; CIS_FireTrigger() pulses it per line.            */
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);  /* 0 width = no pulse yet  */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+  CIS_TriggerDMA_Init();   /* update-event DMA that shapes multi-cycle pulses */
 
   /* 3) LEDs off initially (assuming active-high; flip if your LEDs are active-low) */
   HAL_GPIO_WritePin(GPIOF, GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_SET);
@@ -524,15 +541,73 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-/* A capture was requested by the PC ('s' command) */
-/* A capture was requested by the PC ('s' command) */
+
+/* One-time init of the DMA stream that feeds CCR2 from the TIM1 update event.
+ * DMA1 clock is already enabled by MX_DMA_Init(); Stream2 is unused (Stream0/1
+ * belong to the ADCs). Runs without interrupts - CIS_FireTrigger() aborts the
+ * stream before re-arming it.                                                */
+static void CIS_TriggerDMA_Init(void)
+{
+  hdma_tim1_up.Instance                 = DMA1_Stream2;
+  hdma_tim1_up.Init.Request             = DMA_REQUEST_TIM1_UP;
+  hdma_tim1_up.Init.Direction           = DMA_MEMORY_TO_PERIPH;
+  hdma_tim1_up.Init.PeriphInc           = DMA_PINC_DISABLE;
+  hdma_tim1_up.Init.MemInc              = DMA_MINC_ENABLE;
+  hdma_tim1_up.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
+  hdma_tim1_up.Init.MemDataAlignment    = DMA_MDATAALIGN_HALFWORD;
+  hdma_tim1_up.Init.Mode                = DMA_NORMAL;
+  hdma_tim1_up.Init.Priority            = DMA_PRIORITY_HIGH;
+  hdma_tim1_up.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+  if (HAL_DMA_Init(&hdma_tim1_up) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* Emit a trigger pulse that stays high for width_cycles WHOLE CLK cycles.
+ *
+ * CCR2 alone cannot span more than one timer period (ARR=59), so instead the
+ * TIM1 update event streams a per-period CCR2 value out of trig_dma_buf:
+ *   { ARR+1, ARR+1, ..., ARR+1, 0 }
+ *    \_____ N entries ________/  ^-- ends the pulse
+ * CCR2 = ARR+1 means 100 % duty (high for the full period); the final 0 drops
+ * the pin. CCR2 preload is enabled, so every value takes effect exactly on the
+ * next update -> both edges land on CLK-period boundaries and the width is
+ * cycle-exact regardless of CPU/IRQ load. Rising edge appears within two CLK
+ * cycles of the call.                                                        */
 void CIS_FireTrigger(uint16_t width_cycles)
 {
-  /* width_cycles is interpreted against the TIM1 period (ARR=59 -> 60 cyc).
-   * If you need pulses longer than one CLK period, drive the trigger from a
-   * separate slave timer instead. For a per-line start marker, a short pulse
-   * (e.g. a fraction of one CLK cycle to a few cycles) is typical.           */
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, width_cycles);
+  if (width_cycles == 0u)
+  {
+    return;                                   /* nothing to emit              */
+  }
+  if (width_cycles > TRIG_MAX_CYCLES)
+  {
+    width_cycles = TRIG_MAX_CYCLES;
+  }
+
+  /* Kill any pulse still in flight. The Abort also returns the HAL DMA handle
+   * to READY (mandatory before HAL_DMA_Start when nothing services the
+   * transfer-complete flag). Forcing CCR2=0 ends an aborted pulse at the next
+   * update.                                                                  */
+  HAL_DMA_Abort(&hdma_tim1_up);
+  __HAL_TIM_DISABLE_DMA(&htim1, TIM_DMA_UPDATE);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
+
+  uint16_t full = (uint16_t)(__HAL_TIM_GET_AUTORELOAD(&htim1) + 1u);
+  for (uint16_t i = 0; i < width_cycles; i++)
+  {
+    trig_dma_buf[i] = full;
+  }
+  trig_dma_buf[width_cycles] = 0u;
+
+  /* One DMA transfer per update event (= per CLK cycle) into CCR2. */
+  if (HAL_DMA_Start(&hdma_tim1_up, (uint32_t)trig_dma_buf,
+                    (uint32_t)&htim1.Instance->CCR2,
+                    (uint32_t)width_cycles + 1u) == HAL_OK)
+  {
+    __HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
+  }
 }
 
 /* Arm the dual ADC + DMA, then emit the trigger. DMA is armed FIRST so no

@@ -281,7 +281,10 @@ static int8_t CDC_Receive_HS(uint8_t* Buf, uint32_t *Len)
         CIS_SetLED(c);
         break;
 
-      case 'd':                       /* set trigger width: 'd' + lo + hi */
+      case 'd':                       /* set trigger width: 'd' + lo + hi.
+                                       * Unit: WHOLE CLK cycles (multi-cycle
+                                       * pulses supported); firmware clamps
+                                       * to TRIG_MAX_CYCLES.                */
         if (i + 2 < n)
         {
           g_trigger_width = (uint16_t)Buf[i+1] | ((uint16_t)Buf[i+2] << 8);
