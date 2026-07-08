@@ -3,16 +3,19 @@
   ******************************************************************************
   * @file           : main.c
   * @brief          : Main program body
-  ******************************************************************************
-  * @attention
   *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
+  * CIS scanner front-end (STM32H723 @ 360 MHz SYSCLK / 180 MHz TIM1 kernel).
   *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
+  * Timing summary:
+  *   TIM1 kernel clock ........ 180 MHz  (SYSCLK 360 -> AHB /2 -> APB2 /2 -> x2)
+  *   TIM1 update rate ......... 3 MHz    (ARR = 59  ->  180 / 60)
+  *   ADC trigger (T1_TRGO) .... 3 MHz    (one conversion per update)
+  *   CLK on PE9 / TIM1_CH1 .... 1.5 MHz  (toggle mode: one toggle per update)
+  *   Trigger on PE11/TIM1_CH2.. DMA-shaped pulse, N update periods wide
   *
+  * The CLK is a free-running 1.5 MHz square wave generated purely in hardware
+  * (output-compare toggle) and phase-locked to the ADC sampling instants.
+  * The line-start trigger is shaped by a single TIM1_UP -> CCR2 DMA stream.
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -62,14 +65,18 @@ uint16_t adc2_buf[ADC_BUF_LEN];       /* AN_2 / sensor half 2                  *
 
 volatile uint8_t  g_capture_request = 0;   /* set by USB 's' command           */
 volatile uint8_t  g_buffer_ready    = 0;   /* set by ADC1 DMA-complete ISR     */
-volatile uint16_t g_trigger_width   = 30;  /* trigger pulse width (CLK cycles) */
 
-/* --- Multi-cycle trigger pulse ------------------------------------------- */
-/* The trigger (TIM1_CH2 / PE11) can now stay high for WHOLE CLK cycles.
- * Mechanism: a DMA stream fed by the TIM1 update event rewrites CCR2 once per
- * CLK period: N entries of (ARR+1) = 100 % duty (pin high the whole period),
- * then one 0 entry that drops the pin. Pulse width is therefore exactly
- * width_cycles CLK periods, hardware-timed, with no ISR involvement.         */
+/* Trigger pulse width, expressed in TIM1 UPDATE periods (not CLK cycles).
+ * CLK = 1.5 MHz = one full cycle per 2 update periods, so:
+ *     16 CLK cycles  =  32 update periods  ->  g_trigger_width = 32            */
+volatile uint16_t g_trigger_width   = 32;  /* 16 CLK cycles high                */
+
+/* --- Multi-cycle trigger pulse (PE11 / TIM1_CH2) ------------------------- */
+/* The trigger can stay high for a whole number of UPDATE periods. A DMA stream
+ * fed by the TIM1 update event rewrites CCR2 once per update:
+ *   N entries of (ARR+1) = 100 % duty (pin high the whole period),
+ *   then one 0 entry that drops the pin.
+ * Pulse width is therefore exactly N update periods, hardware-timed, no ISR.  */
 #define TRIG_MAX_CYCLES 1024u         /* upper bound for the pulse length      */
 
 /* NOTE: this buffer is read by DMA1 (D2 domain), which CANNOT access DTCM on
@@ -77,8 +84,7 @@ volatile uint16_t g_trigger_width   = 30;  /* trigger pulse width (CLK cycles) *
  * (RAM_D1 / AXI SRAM in the stock CubeMX .ld). D-cache is disabled in this
  * project, so no cache maintenance is required either.                       */
 static uint16_t trig_dma_buf[TRIG_MAX_CYCLES + 1u];
-static DMA_HandleTypeDef hdma_tim1_up; /* DMA1_Stream2 <- TIM1 update request  */
-
+static DMA_HandleTypeDef hdma_tim1_up;   /* DMA1_Stream2 <- TIM1_UP -> CCR2    */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -93,7 +99,7 @@ static void MX_TIM1_Init(void);
 /* USER CODE BEGIN PFP */
 void CIS_StartCapture(void);
 void CIS_SetLED(char color);
-void CIS_FireTrigger(uint16_t width_cycles);
+void CIS_FireTrigger(uint16_t width_periods);
 static void CIS_TriggerDMA_Init(void);
 /* USER CODE END PFP */
 
@@ -146,18 +152,24 @@ int main(void)
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
   HAL_ADCEx_Calibration_Start(&hadc2, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
 
-  /* 1) Start the 3 MHz CLK on PE9 - free running, always on. */
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  /* One-time init of the trigger DMA (TIM1_UP -> CCR2). Note: the TIM update
+   * DMA request (UDE) is left DISABLED here; CIS_FireTrigger() enables it only
+   * for the duration of a pulse.                                             */
+  CIS_TriggerDMA_Init();
 
-  /* 2) Prepare CH2 (trigger) but keep it idle until a line is requested.
-   *    We start it stopped; CIS_FireTrigger() pulses it per line.            */
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);  /* 0 width = no pulse yet  */
+  /* CLK on PE9 (TIM1_CH1, toggle mode): free-running 1.5 MHz, always on.     */
+  HAL_TIM_OC_Start(&htim1, TIM_CHANNEL_1);
+
+  /* Trigger on PE11 (TIM1_CH2): idle low until a line is requested.          */
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);   /* 0 width = no pulse yet */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-  CIS_TriggerDMA_Init();   /* update-event DMA that shapes multi-cycle pulses */
 
-  /* 3) LEDs off initially (assuming active-high; flip if your LEDs are active-low) */
+  /* LEDs off initially (active-low drive: SET = off). */
   HAL_GPIO_WritePin(GPIOF, GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_SET);
 
+  /* Start the timer base last: this begins the 3 MHz update stream that drives
+   * both the ADC trigger (T1_TRGO) and the 1.5 MHz CLK toggle.               */
+  HAL_TIM_Base_Start(&htim1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -177,7 +189,7 @@ int main(void)
       g_buffer_ready = 0;
 
       /* DTCM buffers are not cached -> data is already coherent, no invalidate.
-       * Stream both halves back over USB CDC. CDC_Transmit_FS may return BUSY
+       * Stream both halves back over USB CDC. CDC_Transmit_HS may return BUSY
        * while a previous packet is in flight, so we retry.                    */
       while (CDC_Transmit_HS((uint8_t*)adc1_buf, ADC_BUF_LEN * 2) == USBD_BUSY) { }
       while (CDC_Transmit_HS((uint8_t*)adc2_buf, ADC_BUF_LEN * 2) == USBD_BUSY) { }
@@ -297,7 +309,7 @@ static void MX_ADC1_Init(void)
   */
   hadc1.Instance = ADC1;
   hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
-  hadc1.Init.Resolution = ADC_RESOLUTION_16B;
+  hadc1.Init.Resolution = ADC_RESOLUTION_8B;
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   hadc1.Init.LowPowerAutoWait = DISABLE;
@@ -365,7 +377,7 @@ static void MX_ADC2_Init(void)
   */
   hadc2.Instance = ADC2;
   hadc2.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
-  hadc2.Init.Resolution = ADC_RESOLUTION_16B;
+  hadc2.Init.Resolution = ADC_RESOLUTION_8B;
   hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc2.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   hadc2.Init.LowPowerAutoWait = DISABLE;
@@ -407,6 +419,11 @@ static void MX_ADC2_Init(void)
   * @brief TIM1 Initialization Function
   * @param None
   * @retval None
+  *
+  * ARR = 59  ->  update rate = 180 MHz / 60 = 3 MHz.
+  *   CH1 (PE9)  : TOGGLE mode  -> 1.5 MHz CLK (one toggle per update).
+  *   CH2 (PE11) : PWM1 mode    -> DMA-shaped line-start trigger.
+  *   TRGO       : UPDATE       -> 3 MHz ADC external trigger.
   */
 static void MX_TIM1_Init(void)
 {
@@ -443,6 +460,10 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
+  if (HAL_TIM_OC_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
   sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
@@ -450,17 +471,27 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+
+  /* CH1 (PE9) - CLK: toggle mode. Output flips once per update event, so the
+   * pin runs at half the 3 MHz update rate = 1.5 MHz, 50 % duty. The compare
+   * value only sets the phase of the toggle within the period; keep it away
+   * from 0/ARR so the edge doesn't coincide with the ADC sampling instant.   */
+  sConfigOC.OCMode = TIM_OCMODE_TOGGLE;
   sConfigOC.Pulse = 30;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
   sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
   }
+
+  /* CH2 (PE11) - trigger: PWM1. Idle CCR2 = 0 (pin low); CIS_FireTrigger()
+   * streams (ARR+1) values via DMA to hold it high for N update periods.     */
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
@@ -543,7 +574,7 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /* One-time init of the DMA stream that feeds CCR2 from the TIM1 update event.
- * DMA1 clock is already enabled by MX_DMA_Init(); Stream2 is unused (Stream0/1
+ * DMA1 clock is already enabled by MX_DMA_Init(); Stream2 is free (Stream0/1
  * belong to the ADCs). Runs without interrupts - CIS_FireTrigger() aborts the
  * stream before re-arming it.                                                */
 static void CIS_TriggerDMA_Init(void)
@@ -564,26 +595,26 @@ static void CIS_TriggerDMA_Init(void)
   }
 }
 
-/* Emit a trigger pulse that stays high for width_cycles WHOLE CLK cycles.
+/* Emit a trigger pulse on PE11 (CH2) that stays high for width_periods WHOLE
+ * update periods (16 CLK cycles = 32 update periods).
  *
  * CCR2 alone cannot span more than one timer period (ARR=59), so instead the
  * TIM1 update event streams a per-period CCR2 value out of trig_dma_buf:
  *   { ARR+1, ARR+1, ..., ARR+1, 0 }
  *    \_____ N entries ________/  ^-- ends the pulse
  * CCR2 = ARR+1 means 100 % duty (high for the full period); the final 0 drops
- * the pin. CCR2 preload is enabled, so every value takes effect exactly on the
- * next update -> both edges land on CLK-period boundaries and the width is
- * cycle-exact regardless of CPU/IRQ load. Rising edge appears within two CLK
- * cycles of the call.                                                        */
-void CIS_FireTrigger(uint16_t width_cycles)
+ * the pin. CCR2 preload is enabled (PWM mode), so every value takes effect on
+ * the next update -> both edges land on update boundaries and the width is
+ * exact regardless of CPU/IRQ load.                                          */
+void CIS_FireTrigger(uint16_t width_periods)
 {
-  if (width_cycles == 0u)
+  if (width_periods == 0u)
   {
     return;                                   /* nothing to emit              */
   }
-  if (width_cycles > TRIG_MAX_CYCLES)
+  if (width_periods > TRIG_MAX_CYCLES)
   {
-    width_cycles = TRIG_MAX_CYCLES;
+    width_periods = TRIG_MAX_CYCLES;
   }
 
   /* Kill any pulse still in flight. The Abort also returns the HAL DMA handle
@@ -595,39 +626,23 @@ void CIS_FireTrigger(uint16_t width_cycles)
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
 
   uint16_t full = (uint16_t)(__HAL_TIM_GET_AUTORELOAD(&htim1) + 1u);
-  for (uint16_t i = 0; i < width_cycles; i++)
+  for (uint16_t i = 0; i < width_periods; i++)
   {
     trig_dma_buf[i] = full;
   }
-  trig_dma_buf[width_cycles] = 0u;
+  trig_dma_buf[width_periods] = 0u;
 
-  /* One DMA transfer per update event (= per CLK cycle) into CCR2. */
+  /* One DMA transfer per update event into CCR2. */
   if (HAL_DMA_Start(&hdma_tim1_up, (uint32_t)trig_dma_buf,
                     (uint32_t)&htim1.Instance->CCR2,
-                    (uint32_t)width_cycles + 1u) == HAL_OK)
+                    (uint32_t)width_periods + 1u) == HAL_OK)
   {
     __HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
   }
 }
 
 /* Arm the dual ADC + DMA, then emit the trigger. DMA is armed FIRST so no
- * leading samples are missed once the trigger / clock edges arrive.          */
-// void CIS_StartCapture(void)
-// {
-//   g_buffer_ready = 0;
-//
-//   /* Make sure any previous run is stopped */
-//   HAL_ADC_Stop_DMA(&hadc1);
-//   HAL_ADC_Stop_DMA(&hadc2);
-//
-//   /* Start SLAVE (ADC2) first, then MASTER (ADC1). In regular simultaneous
-//    * dual mode the master's trigger launches both conversions together.       */
-//   HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adc2_buf, ADC_BUF_LEN);
-//   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc1_buf, ADC_BUF_LEN);
-//
-//   /* Emit the line-start trigger pulse (width encodes resolution). */
-//   CIS_FireTrigger(g_trigger_width);
-// }
+ * leading samples are missed once the trigger edges arrive.                  */
 void CIS_StartCapture(void)
 {
   HAL_StatusTypeDef s2, s1;
@@ -638,7 +653,7 @@ void CIS_StartCapture(void)
   s2 = HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adc2_buf, ADC_BUF_LEN);
   s1 = HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc1_buf, ADC_BUF_LEN);
 
-  // DEBUG: if either start failed, send an error byte back so the host sees it
+  /* DEBUG: if either start failed, send an error byte back so the host sees it */
   if (s1 != HAL_OK || s2 != HAL_OK) {
     uint8_t err[2] = {0xEE, (uint8_t)(s1<<4 | s2)};
     while (CDC_Transmit_HS(err, 2) == USBD_BUSY) {}
@@ -647,11 +662,11 @@ void CIS_StartCapture(void)
 }
 
 /* Set the RGB LED state. Mirrors the paper's r/g/b/w/o command set.
- * Assumes active-high drive on PF7=R, PF8=G, PF9=B. Invert if active-low.     */
+ * Assumes active-low drive on PF7=R, PF8=G, PF9=B (RESET = on).              */
 void CIS_SetLED(char color)
 {
   /* All off first */
-  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9, SET);
+  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9, GPIO_PIN_SET);
   switch (color)
   {
     case 'r': HAL_GPIO_WritePin(GPIOF, GPIO_PIN_7, GPIO_PIN_RESET); break;
@@ -663,15 +678,16 @@ void CIS_SetLED(char color)
   }
 }
 
-/* Dual-mode ADC DMA completion. In regular-simultaneous mode the MASTER (ADC1)
- * governs timing; we key "ready" off ADC1 only so we don't double-fire.       */
+/* Dual-mode ADC DMA completion. ADC1 governs timing; we key "ready" off ADC1
+ * only so we don't double-fire.                                              */
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
   if (hadc->Instance == ADC1)
   {
     HAL_ADC_Stop_DMA(&hadc1);
     HAL_ADC_Stop_DMA(&hadc2);
-    /* Stop the trigger pulse (set width 0) until next line. */
+    /* Stop the trigger pulse (CH2 low) until next line. Do NOT touch CH1 -
+     * that is the free-running CLK.                                          */
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
     g_buffer_ready = 1;
   }
